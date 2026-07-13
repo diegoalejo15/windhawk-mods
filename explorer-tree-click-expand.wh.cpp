@@ -17,7 +17,7 @@ By default, in File Explorer's navigation pane (tree view), left-clicking
 a folder only selects it; you have to click the small chevron/arrow to
 expand it.
 
-This mod adds three click behaviors to the navigation pane tree:
+This mod adds four click behaviors to the navigation pane tree:
 
 - **Left click** on a folder's icon or label: expands it one level (like
   pressing Numpad +). The native chevron behavior is untouched.
@@ -25,9 +25,13 @@ This mod adds three click behaviors to the navigation pane tree:
   its original state (all folders collapsed).
 - **Alt + left click** on a folder: expands it and all its subfolders
   recursively, down to the last level (like pressing the Numpad * key).
+- **Shift + left click** on a folder: fully collapses just that folder,
+  resetting the expanded state of its subfolders so that when you expand
+  it again, its children come back collapsed instead of showing
+  everything you had open before.
 
-Both Ctrl+click and Alt+click behaviors can be individually enabled or
-disabled in the mod's settings. Both are enabled by default.
+Ctrl+click, Alt+click, and Shift+click behaviors can each be individually
+enabled or disabled in the mod's settings. All are enabled by default.
 */
 // ==/WindhawkModReadme==
 
@@ -44,6 +48,12 @@ disabled in the mod's settings. Both are enabled by default.
     When enabled, Alt + left click on a folder in the navigation pane
     expands it and all its subfolders recursively (same as pressing the
     Numpad * key).
+- shiftClickCollapseFolder: true
+  $name: Shift+Click to collapse just that folder
+  $description: >-
+    When enabled, Shift + left click on a folder in the navigation pane
+    fully collapses that single folder, resetting the expanded state of
+    its subfolders so they come back collapsed the next time it's opened.
 */
 // ==/WindhawkModSettings==
 
@@ -56,6 +66,7 @@ HWND g_hHiddenWnd = nullptr;
 
 bool g_settingCtrlClickCollapseAll = true;
 bool g_settingAltClickExpandAll = true;
+bool g_settingShiftClickCollapseFolder = true;
 
 constexpr UINT WM_APP_COLLAPSE_ALL = WM_APP + 1;
 constexpr UINT WM_APP_EXPAND_ALL = WM_APP + 2;
@@ -97,6 +108,7 @@ void ExpandAll(HWND hwndTree, HTREEITEM hItem) {
 void LoadSettings() {
     g_settingCtrlClickCollapseAll = Wh_GetIntSetting(L"ctrlClickCollapseAll") != 0;
     g_settingAltClickExpandAll = Wh_GetIntSetting(L"altClickExpandAll") != 0;
+    g_settingShiftClickCollapseFolder = Wh_GetIntSetting(L"shiftClickCollapseFolder") != 0;
 }
 
 LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -141,12 +153,22 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
             if (hItem && onItemBody) {
                 bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
                 bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+                bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
 
                 if (ctrlDown && g_settingCtrlClickCollapseAll) {
                     PostMessage(g_hHiddenWnd, WM_APP_COLLAPSE_ALL, (WPARAM)hWnd, 0);
                 } else if (altDown && g_settingAltClickExpandAll) {
                     PostMessage(g_hHiddenWnd, WM_APP_EXPAND_ALL, (WPARAM)hWnd, (LPARAM)hItem);
-                } else if (!ctrlDown && !altDown) {
+                } else if (shiftDown && g_settingShiftClickCollapseFolder) {
+                    // Collapse just this one folder. TVE_COLLAPSERESET on top
+                    // of TVE_COLLAPSE also resets the expanded state of its
+                    // children, so re-expanding later starts fresh instead of
+                    // showing every subfolder that was previously open - this
+                    // is a single, non-recursive operation, so it's safe to
+                    // post directly to the tree instead of routing through
+                    // the hidden window.
+                    PostMessage(hWnd, TVM_EXPAND, TVE_COLLAPSE | TVE_COLLAPSERESET, (LPARAM)hItem);
+                } else if (!ctrlDown && !altDown && !shiftDown) {
                     TVITEM item{};
                     item.mask = TVIF_STATE | TVIF_CHILDREN;
                     item.hItem = hItem;
