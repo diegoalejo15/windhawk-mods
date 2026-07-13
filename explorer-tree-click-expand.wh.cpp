@@ -1,6 +1,6 @@
 // ==WindhawkMod==
 // @id              explorer-tree-click-expand
-// @name            Expand folder on click (nav pane)
+// @name            Expand folder on click (Explorer nav pane)
 // @description     Left click expands a folder one level; Ctrl+click collapses the whole tree; Alt+click expands all subfolders
 // @version         1.0
 // @author          Didi
