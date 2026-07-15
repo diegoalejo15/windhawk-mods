@@ -2,7 +2,7 @@
 // @id              explorer-tree-click-expand
 // @name            Expand folder on click (Explorer nav pane)
 // @description     Left click expands a folder one level; Ctrl+click collapses the whole tree; Alt+click expands all subfolders
-// @version         1.0
+// @version         1.1
 // @author          Didi
 // @github          https://github.com/diegoalejo15
 // @include         explorer.exe
@@ -32,6 +32,13 @@ This mod adds four click behaviors to the navigation pane tree:
 
 Ctrl+click, Alt+click, and Shift+click behaviors can each be individually
 enabled or disabled in the mod's settings. All are enabled by default.
+
+Only acts on tree views that belong to Explorer itself. Navigation panes
+shown inside other programs' Open/Save file dialogs (Cubase, Excel,
+etc.) are left completely untouched - talking to a tree view control
+living in another program's process turned out to be unreliable (it
+could hang or crash the other program), so this mod deliberately stays
+out of that territory.
 */
 // ==/WindhawkModReadme==
 
@@ -71,6 +78,44 @@ bool g_settingShiftClickCollapseFolder = true;
 constexpr UINT WM_APP_COLLAPSE_ALL = WM_APP + 1;
 constexpr UINT WM_APP_EXPAND_ALL = WM_APP + 2;
 constexpr wchar_t kHiddenWndClass[] = L"ExplorerTreeClickExpandHiddenWnd";
+
+// Cache of the last window we checked, so we don't call
+// OpenProcess/QueryFullProcessImageName on every single mouse click -
+// only when the hovered window actually changes.
+HWND g_lastCheckedWnd = nullptr;
+bool g_lastCheckedIsExplorer = false;
+
+// Returns true only if hWnd belongs to an explorer.exe process. This mod
+// only ever acts on Explorer's own tree views - navigation panes shown
+// inside other programs' Open/Save file dialogs are left completely
+// alone, since talking to a tree view living in another program's
+// process proved unreliable (it could hang or crash that program).
+bool IsExplorerWindow(HWND hWnd) {
+    if (hWnd == g_lastCheckedWnd) {
+        return g_lastCheckedIsExplorer;
+    }
+
+    bool isExplorer = false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid) {
+        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (hProcess) {
+            wchar_t path[MAX_PATH];
+            DWORD size = ARRAYSIZE(path);
+            if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
+                wchar_t* fileName = wcsrchr(path, L'\\');
+                fileName = fileName ? fileName + 1 : path;
+                isExplorer = _wcsicmp(fileName, L"explorer.exe") == 0;
+            }
+            CloseHandle(hProcess);
+        }
+    }
+
+    g_lastCheckedWnd = hWnd;
+    g_lastCheckedIsExplorer = isExplorer;
+    return isExplorer;
+}
 
 void CollapseAll(HWND hwndTree, HTREEITEM hItem) {
     while (hItem) {
@@ -137,7 +182,8 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
 
         wchar_t className[64];
         if (hWnd && GetClassNameW(hWnd, className, ARRAYSIZE(className)) &&
-            wcscmp(className, L"SysTreeView32") == 0) {
+            wcscmp(className, L"SysTreeView32") == 0 &&
+            IsExplorerWindow(hWnd)) {
 
             POINT clientPt = info->pt;
             ScreenToClient(hWnd, &clientPt);
@@ -223,4 +269,5 @@ void Wh_ModUninit() {
         g_hHiddenWnd = nullptr;
     }
     UnregisterClassW(kHiddenWndClass, GetModuleHandle(nullptr));
+    g_lastCheckedWnd = nullptr;
 }
