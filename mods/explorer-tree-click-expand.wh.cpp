@@ -2,10 +2,11 @@
 // @id              explorer-tree-click-expand
 // @name            Expand folder on click (Explorer nav pane)
 // @description     Left click expands a folder one level; Ctrl+click collapses the whole tree; Alt+click expands all subfolders
-// @version         1.1
+// @version         1.2
 // @author          Didi
 // @github          https://github.com/diegoalejo15
 // @include         explorer.exe
+// @compilerOptions -lcomctl32
 // @architecture    x86-64
 // ==/WindhawkMod==
 
@@ -33,12 +34,21 @@ This mod adds four click behaviors to the navigation pane tree:
 Ctrl+click, Alt+click, and Shift+click behaviors can each be individually
 enabled or disabled in the mod's settings. All are enabled by default.
 
-Only acts on tree views that belong to Explorer itself. Navigation panes
-shown inside other programs' Open/Save file dialogs (Cubase, Excel,
-etc.) are left completely untouched - talking to a tree view control
-living in another program's process turned out to be unreliable (it
-could hang or crash the other program), so this mod deliberately stays
-out of that territory.
+The mod works by subclassing the navigation pane's tree view control
+directly (it's identified by its parent being a `NamespaceTreeControl`,
+which is specific to Explorer's nav pane). Tree views shown inside other
+programs' Open/Save file dialogs (Cubase, Excel, etc.), or any other tree
+view elsewhere in Explorer, are never touched, since only the nav pane's
+own tree view control is ever subclassed.
+
+By default this mod only runs inside `explorer.exe`, so it only affects
+the navigation pane of File Explorer windows. Many other programs' Open/
+Save dialogs use the same navigation pane control, so if you'd like this
+mod's click behaviors to also work there, you can add those programs'
+executable names (e.g. `EXCEL.EXE`) to the mod's process inclusion list
+from the "Advanced" tab of this mod's settings in Windhawk - no code
+changes needed. The mod only ever touches the process it's running in, so
+this is safe to do for as many or as few programs as you'd like.
 */
 // ==/WindhawkModReadme==
 
@@ -64,64 +74,38 @@ out of that territory.
 */
 // ==/WindhawkModSettings==
 
+#include <windhawk_utils.h>
+
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
 
-HHOOK g_hMouseHook = nullptr;
-HWND g_hHiddenWnd = nullptr;
+#include <algorithm>
+#include <mutex>
+#include <vector>
 
 bool g_settingCtrlClickCollapseAll = true;
 bool g_settingAltClickExpandAll = true;
 bool g_settingShiftClickCollapseFolder = true;
 
-constexpr UINT WM_APP_COLLAPSE_ALL = WM_APP + 1;
-constexpr UINT WM_APP_EXPAND_ALL = WM_APP + 2;
-constexpr wchar_t kHiddenWndClass[] = L"ExplorerTreeClickExpandHiddenWnd";
+// The nav pane's tree view is a direct child of a NamespaceTreeControl
+// window. This is specific to Explorer's own navigation pane, so checking
+// for it lets us subclass exactly (and only) the tree we care about -
+// nothing in other processes, and nothing else within Explorer itself.
+constexpr WCHAR kNavPaneParentClassName[] = L"NamespaceTreeControl";
+constexpr WCHAR kTreeViewClassName[] = L"SysTreeView32";
 
-// Cache of the last window we checked, so we don't call
-// OpenProcess/QueryFullProcessImageName on every single mouse click -
-// only when the hovered window actually changes.
-HWND g_lastCheckedWnd = nullptr;
-bool g_lastCheckedIsExplorer = false;
+// Tracks every tree view we've subclassed so Wh_ModUninit can remove all
+// subclasses before the mod DLL is unloaded (otherwise a leftover subclass
+// pointing into unloaded code would crash Explorer on the next click).
+std::mutex g_subclassedTreesMutex;
+std::vector<HWND> g_subclassedTrees;
 
-// Returns true only if hWnd belongs to an explorer.exe process. This mod
-// only ever acts on Explorer's own tree views - navigation panes shown
-// inside other programs' Open/Save file dialogs are left completely
-// alone, since talking to a tree view living in another program's
-// process proved unreliable (it could hang or crash that program).
-bool IsExplorerWindow(HWND hWnd) {
-    if (hWnd == g_lastCheckedWnd) {
-        return g_lastCheckedIsExplorer;
-    }
-
-    bool isExplorer = false;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hWnd, &pid);
-    if (pid) {
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (hProcess) {
-            wchar_t path[MAX_PATH];
-            DWORD size = ARRAYSIZE(path);
-            if (QueryFullProcessImageNameW(hProcess, 0, path, &size)) {
-                wchar_t* fileName = wcsrchr(path, L'\\');
-                fileName = fileName ? fileName + 1 : path;
-                isExplorer = _wcsicmp(fileName, L"explorer.exe") == 0;
-            }
-            CloseHandle(hProcess);
-        }
-    }
-
-    g_lastCheckedWnd = hWnd;
-    g_lastCheckedIsExplorer = isExplorer;
-    return isExplorer;
-}
-
-void CollapseAll(HWND hwndTree, HTREEITEM hItem) {
+void CollapseAllRecursive(HWND hwndTree, HTREEITEM hItem) {
     while (hItem) {
         HTREEITEM hChild = TreeView_GetChild(hwndTree, hItem);
         if (hChild) {
-            CollapseAll(hwndTree, hChild);
+            CollapseAllRecursive(hwndTree, hChild);
         }
         TreeView_Expand(hwndTree, hItem, TVE_COLLAPSE);
         hItem = TreeView_GetNextSibling(hwndTree, hItem);
@@ -134,17 +118,21 @@ void CollapseAll(HWND hwndTree, HTREEITEM hItem) {
 // out-of-the-box state instead of hiding everything.
 void CollapseAllKeepingRoot(HWND hwndTree) {
     HTREEITEM hRoot = TreeView_GetRoot(hwndTree);
-    if (!hRoot) return;
+    if (!hRoot) {
+        return;
+    }
 
     TreeView_Expand(hwndTree, hRoot, TVE_EXPAND);
-    CollapseAll(hwndTree, TreeView_GetChild(hwndTree, hRoot));
+    CollapseAllRecursive(hwndTree, TreeView_GetChild(hwndTree, hRoot));
 }
 
 void ExpandAll(HWND hwndTree, HTREEITEM hItem) {
     // Select the item first - the native "*" (Numpad Multiply) behavior
     // expands the currently selected/focused item and all its descendants,
     // and it's implemented internally in a fast, non-blocking way (unlike
-    // manually walking the tree with TVM_EXPAND calls).
+    // manually walking the tree with TVM_EXPAND calls). This all runs on
+    // the tree's own thread now, so these SendMessage calls are same-
+    // thread and safe.
     TreeView_SelectItem(hwndTree, hItem);
     SendMessage(hwndTree, WM_KEYDOWN, VK_MULTIPLY, 0);
     SendMessage(hwndTree, WM_KEYUP, VK_MULTIPLY, 0);
@@ -156,103 +144,158 @@ void LoadSettings() {
     g_settingShiftClickCollapseFolder = Wh_GetIntSetting(L"shiftClickCollapseFolder") != 0;
 }
 
-LRESULT CALLBACK HiddenWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_APP_COLLAPSE_ALL) {
-        HWND hTreeWnd = (HWND)wParam;
-        if (hTreeWnd && IsWindow(hTreeWnd)) {
-            CollapseAllKeepingRoot(hTreeWnd);
-        }
-        return 0;
+void ForgetSubclassedTree(HWND hWnd) {
+    std::lock_guard<std::mutex> lock(g_subclassedTreesMutex);
+    auto it = std::find(g_subclassedTrees.begin(), g_subclassedTrees.end(), hWnd);
+    if (it != g_subclassedTrees.end()) {
+        g_subclassedTrees.erase(it);
     }
-    if (msg == WM_APP_EXPAND_ALL) {
-        HWND hTreeWnd = (HWND)wParam;
-        HTREEITEM hItem = (HTREEITEM)lParam;
-        if (hTreeWnd && IsWindow(hTreeWnd) && hItem) {
-            ExpandAll(hTreeWnd, hItem);
-        }
-        return 0;
-    }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN) {
-        MSLLHOOKSTRUCT* info = (MSLLHOOKSTRUCT*)lParam;
-        HWND hWnd = WindowFromPoint(info->pt);
+LRESULT CALLBACK TreeViewSubclassProc(HWND hWnd, UINT uMsg, WPARAM wParam,
+                                       LPARAM lParam, UINT_PTR uIdSubclass) {
+    if (uMsg == WM_LBUTTONDOWN) {
+        POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
 
-        wchar_t className[64];
-        if (hWnd && GetClassNameW(hWnd, className, ARRAYSIZE(className)) &&
-            wcscmp(className, L"SysTreeView32") == 0 &&
-            IsExplorerWindow(hWnd)) {
+        TVHITTESTINFO hitTest{};
+        hitTest.pt = pt;
+        HTREEITEM hItem = TreeView_HitTest(hWnd, &hitTest);
 
-            POINT clientPt = info->pt;
-            ScreenToClient(hWnd, &clientPt);
+        // Only act if the click landed on the icon or label, NOT on the
+        // expand/collapse chevron (that one already toggles natively).
+        bool onItemBody =
+            (hitTest.flags & (TVHT_ONITEMICON | TVHT_ONITEMLABEL)) != 0;
 
-            TVHITTESTINFO hitTest{};
-            hitTest.pt = clientPt;
-            HTREEITEM hItem = (HTREEITEM)SendMessage(hWnd, TVM_HITTEST, 0, (LPARAM)&hitTest);
+        if (hItem && onItemBody) {
+            bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+            bool altDown = (GetKeyState(VK_MENU) & 0x8000) != 0;
+            bool shiftDown = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
 
-            // Only act if the click landed on the icon or label, NOT on the
-            // expand/collapse chevron (that one already toggles natively).
-            bool onItemBody = (hitTest.flags & (TVHT_ONITEMICON | TVHT_ONITEMLABEL)) != 0;
+            // Let the tree handle the click natively first (selection,
+            // chevron toggle, etc.), then layer our behavior on top -
+            // matching how a global hook that doesn't consume the message
+            // would behave.
+            LRESULT result = DefSubclassProc(hWnd, uMsg, wParam, lParam);
 
-            if (hItem && onItemBody) {
-                bool ctrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-                bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-                bool shiftDown = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+            if (ctrlDown && g_settingCtrlClickCollapseAll) {
+                CollapseAllKeepingRoot(hWnd);
+            } else if (altDown && g_settingAltClickExpandAll) {
+                ExpandAll(hWnd, hItem);
+            } else if (shiftDown && g_settingShiftClickCollapseFolder) {
+                // TVE_COLLAPSERESET on top of TVE_COLLAPSE also resets the
+                // expanded state of the item's children, so re-expanding
+                // later starts fresh instead of showing every subfolder
+                // that was previously open.
+                TreeView_Expand(hWnd, hItem, TVE_COLLAPSE | TVE_COLLAPSERESET);
+            } else if (!ctrlDown && !altDown && !shiftDown) {
+                TVITEM item{};
+                item.mask = TVIF_STATE | TVIF_CHILDREN;
+                item.hItem = hItem;
+                item.stateMask = TVIS_EXPANDED;
+                TreeView_GetItem(hWnd, &item);
 
-                if (ctrlDown && g_settingCtrlClickCollapseAll) {
-                    PostMessage(g_hHiddenWnd, WM_APP_COLLAPSE_ALL, (WPARAM)hWnd, 0);
-                } else if (altDown && g_settingAltClickExpandAll) {
-                    PostMessage(g_hHiddenWnd, WM_APP_EXPAND_ALL, (WPARAM)hWnd, (LPARAM)hItem);
-                } else if (shiftDown && g_settingShiftClickCollapseFolder) {
-                    // Collapse just this one folder. TVE_COLLAPSERESET on top
-                    // of TVE_COLLAPSE also resets the expanded state of its
-                    // children, so re-expanding later starts fresh instead of
-                    // showing every subfolder that was previously open - this
-                    // is a single, non-recursive operation, so it's safe to
-                    // post directly to the tree instead of routing through
-                    // the hidden window.
-                    PostMessage(hWnd, TVM_EXPAND, TVE_COLLAPSE | TVE_COLLAPSERESET, (LPARAM)hItem);
-                } else if (!ctrlDown && !altDown && !shiftDown) {
-                    TVITEM item{};
-                    item.mask = TVIF_STATE | TVIF_CHILDREN;
-                    item.hItem = hItem;
-                    item.stateMask = TVIS_EXPANDED;
-                    SendMessage(hWnd, TVM_GETITEM, 0, (LPARAM)&item);
+                bool hasChildren = item.cChildren != 0;
+                bool isExpanded = (item.state & TVIS_EXPANDED) != 0;
 
-                    bool hasChildren = item.cChildren != 0;
-                    bool isExpanded = (item.state & TVIS_EXPANDED) != 0;
-
-                    if (hasChildren && !isExpanded) {
-                        // Post (non-blocking) so we don't delay the system's
-                        // mouse hook chain.
-                        PostMessage(hWnd, TVM_EXPAND, TVE_EXPAND, (LPARAM)hItem);
-                    }
+                if (hasChildren && !isExpanded) {
+                    TreeView_Expand(hWnd, hItem, TVE_EXPAND);
                 }
             }
+
+            return result;
+        }
+    } else if (uMsg == WM_NCDESTROY) {
+        ForgetSubclassedTree(hWnd);
+        WindhawkUtils::RemoveWindowSubclassFromAnyThread(hWnd, TreeViewSubclassProc);
+    }
+
+    return DefSubclassProc(hWnd, uMsg, wParam, lParam);
+}
+
+void TrySubclassTreeView(HWND hTreeWnd) {
+    HWND hParent = GetParent(hTreeWnd);
+    if (!hParent) {
+        return;
+    }
+
+    WCHAR parentClassName[64];
+    if (!GetClassNameW(hParent, parentClassName, ARRAYSIZE(parentClassName)) ||
+        _wcsicmp(parentClassName, kNavPaneParentClassName) != 0) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_subclassedTreesMutex);
+        if (std::find(g_subclassedTrees.begin(), g_subclassedTrees.end(),
+                       hTreeWnd) != g_subclassedTrees.end()) {
+            return;
         }
     }
 
-    return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
+    if (WindhawkUtils::SetWindowSubclassFromAnyThread(hTreeWnd, TreeViewSubclassProc,
+                                                        0)) {
+        std::lock_guard<std::mutex> lock(g_subclassedTreesMutex);
+        g_subclassedTrees.push_back(hTreeWnd);
+    }
+}
+
+using CreateWindowExW_t = decltype(&CreateWindowExW);
+CreateWindowExW_t CreateWindowExW_Original;
+HWND WINAPI CreateWindowExW_Hook(DWORD dwExStyle, LPCWSTR lpClassName,
+                                  LPCWSTR lpWindowName, DWORD dwStyle, int X,
+                                  int Y, int nWidth, int nHeight,
+                                  HWND hWndParent, HMENU hMenu,
+                                  HINSTANCE hInstance, LPVOID lpParam) {
+    HWND hWnd = CreateWindowExW_Original(dwExStyle, lpClassName, lpWindowName,
+                                          dwStyle, X, Y, nWidth, nHeight,
+                                          hWndParent, hMenu, hInstance, lpParam);
+
+    // lpClassName can be an atom (a small integer cast to a pointer) rather
+    // than a real string pointer, so only touch it as a string once we know
+    // it's not one.
+    if (hWnd && hWndParent &&
+        ((ULONG_PTR)lpClassName & ~(ULONG_PTR)0xffff) != 0 &&
+        _wcsicmp(lpClassName, kTreeViewClassName) == 0) {
+        TrySubclassTreeView(hWnd);
+    }
+
+    return hWnd;
+}
+
+// Finds nav pane tree views that already exist in a given top-level window
+// (used at init time, in case Explorer windows were already open before the
+// mod was loaded).
+BOOL CALLBACK EnumTreeChildProc(HWND hWnd, LPARAM lParam) {
+    WCHAR className[64];
+    if (GetClassNameW(hWnd, className, ARRAYSIZE(className)) &&
+        _wcsicmp(className, kTreeViewClassName) == 0) {
+        TrySubclassTreeView(hWnd);
+    }
+    return TRUE;
+}
+
+BOOL CALLBACK EnumTopLevelWindowsProc(HWND hWnd, LPARAM lParam) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid == GetCurrentProcessId()) {
+        EnumChildWindows(hWnd, EnumTreeChildProc, 0);
+    }
+    return TRUE;
 }
 
 BOOL Wh_ModInit() {
     LoadSettings();
 
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = HiddenWndProc;
-    wc.hInstance = GetModuleHandle(nullptr);
-    wc.lpszClassName = kHiddenWndClass;
-    RegisterClassW(&wc);
+    WindhawkUtils::SetFunctionHook(CreateWindowExW, CreateWindowExW_Hook,
+                                    &CreateWindowExW_Original);
 
-    g_hHiddenWnd = CreateWindowW(
-        kHiddenWndClass, L"", 0, 0, 0, 0, 0,
-        HWND_MESSAGE, nullptr, GetModuleHandle(nullptr), nullptr
-    );
+    return TRUE;
+}
 
-    g_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandle(nullptr), 0);
-    return g_hMouseHook != nullptr;
+void Wh_ModAfterInit() {
+    // Pick up nav pane tree views in Explorer windows that were already
+    // open when the mod was loaded.
+    EnumWindows(EnumTopLevelWindowsProc, 0);
 }
 
 void Wh_ModSettingsChanged() {
@@ -260,14 +303,14 @@ void Wh_ModSettingsChanged() {
 }
 
 void Wh_ModUninit() {
-    if (g_hMouseHook) {
-        UnhookWindowsHookEx(g_hMouseHook);
-        g_hMouseHook = nullptr;
+    std::vector<HWND> trees;
+    {
+        std::lock_guard<std::mutex> lock(g_subclassedTreesMutex);
+        trees = g_subclassedTrees;
+        g_subclassedTrees.clear();
     }
-    if (g_hHiddenWnd) {
-        DestroyWindow(g_hHiddenWnd);
-        g_hHiddenWnd = nullptr;
+
+    for (HWND hTree : trees) {
+        WindhawkUtils::RemoveWindowSubclassFromAnyThread(hTree, TreeViewSubclassProc);
     }
-    UnregisterClassW(kHiddenWndClass, GetModuleHandle(nullptr));
-    g_lastCheckedWnd = nullptr;
 }
