@@ -18,6 +18,8 @@ By default, in File Explorer's navigation pane (tree view), left-clicking
 a folder only selects it; you have to click the small chevron/arrow to
 expand it.
 
+![Demo](https://i.imgur.com/9pmZye3.gif)
+
 This mod adds four click behaviors to the navigation pane tree:
 
 - **Left click** on a folder's icon or label: expands it one level (like
@@ -112,18 +114,17 @@ void CollapseAllRecursive(HWND hwndTree, HTREEITEM hItem) {
     }
 }
 
-// Collapses everything in the tree except the very top-level root item
-// (e.g. "Desktop"), which stays expanded so its direct children (Home,
-// Gallery, Dropbox, etc.) remain visible - matching the tree's original
-// out-of-the-box state instead of hiding everything.
+// Collapses everything below each top-level root item (e.g. "Home",
+// "This PC", "Network" on the default layout, or just "Desktop" when
+// "Show all folders" is enabled), keeping the roots themselves visible -
+// matching the tree's original out-of-the-box state instead of hiding
+// everything. The default nav pane layout has several sibling root items,
+// so all of them need to be walked, not just the first one.
 void CollapseAllKeepingRoot(HWND hwndTree) {
-    HTREEITEM hRoot = TreeView_GetRoot(hwndTree);
-    if (!hRoot) {
-        return;
+    for (HTREEITEM hRoot = TreeView_GetRoot(hwndTree); hRoot;
+         hRoot = TreeView_GetNextSibling(hwndTree, hRoot)) {
+        CollapseAllRecursive(hwndTree, TreeView_GetChild(hwndTree, hRoot));
     }
-
-    TreeView_Expand(hwndTree, hRoot, TVE_EXPAND);
-    CollapseAllRecursive(hwndTree, TreeView_GetChild(hwndTree, hRoot));
 }
 
 void ExpandAll(HWND hwndTree, HTREEITEM hItem) {
